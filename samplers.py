@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import copy
 from typing import TYPE_CHECKING
 import math
 
 if TYPE_CHECKING:
     from comfy.model_patcher import ModelPatcher
+
 import torch
 from torch._dynamo.eval_frame import OptimizedModule
 import torch._dynamo
@@ -22,10 +22,12 @@ from comfy.samplers import (
     sampler_object,
     KSampler,
 )
+
 import comfy.sampler_helpers
 import comfy.model_patcher
 import comfy.patcher_extension
 import comfy.hooks
+
 from comfy.ldm.flux.model import Flux
 from comfy.ldm.chroma.model import Chroma
 from comfy.ldm.modules.diffusionmodules.openaimodel import UNetModel
@@ -45,24 +47,56 @@ from .hidream.model import NAGHiDreamImageTransformer2DModelSwitch
 from .lumina2.model import NAGNextDiTSwitch
 
 
+def safe_clone_structure(obj):
+    """
+    Avoid copy.deepcopy on CUDA-backed tensors/storages.
+    Clone tensors explicitly; recursively copy Python containers.
+    """
+    if torch.is_tensor(obj):
+        return obj.clone()
+
+    if isinstance(obj, dict):
+        return {k: safe_clone_structure(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [safe_clone_structure(v) for v in obj]
+
+    if isinstance(obj, tuple):
+        return tuple(safe_clone_structure(v) for v in obj)
+
+    # leave scalars / strings / None / custom immutable-ish objects as-is
+    return obj
+
+
 def sample_with_nag(
-        model,
-        noise,
-        positive, negative, nag_negative,
-        cfg,
-        nag_scale, nag_tau, nag_alpha, nag_sigma_end,
-        device,
-        sampler,
-        sigmas,
-        model_options={},
-        latent_image=None, denoise_mask=None, callback=None, disable_pbar=False, seed=None,
-        latent_shapes=None, **kwargs,
+    model,
+    noise,
+    positive,
+    negative,
+    nag_negative,
+    cfg,
+    nag_scale,
+    nag_tau,
+    nag_alpha,
+    nag_sigma_end,
+    device,
+    sampler,
+    sigmas,
+    model_options={},
+    latent_image=None,
+    denoise_mask=None,
+    callback=None,
+    disable_pbar=False,
+    seed=None,
+    latent_shapes=None,
+    **kwargs,
 ):
     guider = NAGCFGGuider(model)
     guider.set_conds(positive, negative)
     guider.set_cfg(cfg)
-    guider.set_batch_size(latent_image.shape[0])
+    guider.set_batch_size(latent_image.shape[0] if latent_image is not None else 1)
     guider.set_nag(nag_negative, nag_scale, nag_tau, nag_alpha, nag_sigma_end)
+
     return guider.sample(
         noise,
         latent_image,
@@ -84,12 +118,16 @@ class NAGCFGGuider(CFGGuider):
         self.nag_scale = 5.0
         self.nag_tau = 3.5
         self.nag_alpha = 0.25
-        self.nag_sigma_end = 0.
+        self.nag_sigma_end = 0.0
         self.batch_size = 1
+        self.nag_negative_cond = None
 
     def set_conds(self, positive, negative=None):
         self.inner_set_conds(
-            {"positive": positive, "negative": negative} if negative is not None else {"positive": positive})
+            {"positive": positive, "negative": negative}
+            if negative is not None
+            else {"positive": positive}
+        )
 
     def set_batch_size(self, batch_size):
         self.batch_size = batch_size
@@ -104,11 +142,27 @@ class NAGCFGGuider(CFGGuider):
     def __call__(self, *args, **kwargs):
         return self.predict_noise(*args, **kwargs)
 
-    def inner_sample(self, noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=None, **kwargs):
-        if latent_image is not None and torch.count_nonzero(latent_image) > 0: #Don't shift the empty latent image.
+    def inner_sample(
+        self,
+        noise,
+        latent_image,
+        device,
+        sampler,
+        sigmas,
+        denoise_mask,
+        callback,
+        disable_pbar,
+        seed,
+        latent_shapes=None,
+        **kwargs,
+    ):
+        if latent_image is not None and torch.count_nonzero(latent_image) > 0:
+            # Don't shift the empty latent image.
             latent_image = self.inner_model.process_latent_in(latent_image)
 
-        self.conds = process_conds(self.inner_model, noise, self.conds, device, latent_image, denoise_mask, seed)
+        self.conds = process_conds(
+            self.inner_model, noise, self.conds, device, latent_image, denoise_mask, seed
+        )
 
         extra_model_options = comfy.model_patcher.create_model_options_clone(self.model_options)
         extra_model_options.setdefault("transformer_options", {})["sample_sigmas"] = sigmas
@@ -117,8 +171,13 @@ class NAGCFGGuider(CFGGuider):
         executor = comfy.patcher_extension.WrapperExecutor.new_class_executor(
             sampler.sample,
             sampler,
-            comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE, extra_args["model_options"], is_model_options=True)
+            comfy.patcher_extension.get_all_wrappers(
+                comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE,
+                extra_args["model_options"],
+                is_model_options=True,
+            ),
         )
+
         samples = executor.execute(
             self,
             sigmas,
@@ -131,7 +190,19 @@ class NAGCFGGuider(CFGGuider):
         )
         return self.inner_model.process_latent_out(samples.to(torch.float32))
 
-    def sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None, latent_shapes=None, **kwargs):
+    def sample(
+        self,
+        noise,
+        latent_image,
+        sampler,
+        sigmas,
+        denoise_mask=None,
+        callback=None,
+        disable_pbar=False,
+        seed=None,
+        latent_shapes=None,
+        **kwargs,
+    ):
         if sigmas.shape[-1] == 0:
             return latent_image
 
@@ -140,16 +211,23 @@ class NAGCFGGuider(CFGGuider):
             self.conds[k] = list(map(lambda a: a.copy(), self.original_conds[k]))
         preprocess_conds_hooks(self.conds)
 
-        apply_guidance = self.nag_scale > 1.
+        apply_guidance = (
+            self.nag_scale > 1.0
+            and self.origin_nag_negative_cond is not None
+        )
 
         self.nag_negative_cond = None
+        switcher = None
+
         if apply_guidance:
-            self.nag_negative_cond = copy.deepcopy(self.origin_nag_negative_cond)
+            self.nag_negative_cond = safe_clone_structure(self.origin_nag_negative_cond)
 
             model = self.model_patcher.model.diffusion_model
             if isinstance(model, OptimizedModule):
                 model = model._orig_mod
+
             model_type = type(model)
+
             if model_type == Flux:
                 switcher_cls = NAGFluxSwitch
             elif model_type == Chroma:
@@ -167,33 +245,57 @@ class NAGCFGGuider(CFGGuider):
             elif model_type == HiDreamImageTransformer2DModel:
                 switcher_cls = NAGHiDreamImageTransformer2DModelSwitch
             else:
-                raise ValueError(
-                    f"Model type {model_type} is not support for NAGCFGGuider"
-                )
-            self.nag_negative_cond[0][0] = self.nag_negative_cond[0][0].expand(self.batch_size, -1, -1)
-            if self.nag_negative_cond[0][1].get("pooled_output", None) is not None:
-                self.nag_negative_cond[0][1]["pooled_output"] = self.nag_negative_cond[0][1]["pooled_output"].expand(self.batch_size, -1)
+                raise ValueError(f"Model type {model_type} is not support for NAGCFGGuider")
+
+            # Defensive shape handling
+            if (
+                isinstance(self.nag_negative_cond, list)
+                and len(self.nag_negative_cond) > 0
+                and isinstance(self.nag_negative_cond[0], (list, tuple))
+                and len(self.nag_negative_cond[0]) > 1
+            ):
+                cond_tensor = self.nag_negative_cond[0][0]
+                cond_dict = self.nag_negative_cond[0][1]
+
+                if torch.is_tensor(cond_tensor) and cond_tensor.shape[0] != self.batch_size:
+                    self.nag_negative_cond[0][0] = cond_tensor.expand(self.batch_size, -1, -1)
+
+                pooled = cond_dict.get("pooled_output", None)
+                if torch.is_tensor(pooled) and pooled.shape[0] != self.batch_size:
+                    cond_dict["pooled_output"] = pooled.expand(self.batch_size, -1)
+
             switcher = switcher_cls(
                 model,
                 self.nag_negative_cond,
-                self.nag_scale, self.nag_tau, self.nag_alpha, self.nag_sigma_end,
+                self.nag_scale,
+                self.nag_tau,
+                self.nag_alpha,
+                self.nag_sigma_end,
             )
             switcher.set_nag()
 
         try:
             orig_model_options = self.model_options
             self.model_options = comfy.model_patcher.create_model_options_clone(self.model_options)
-            # if one hook type (or just None), then don't bother caching weights for hooks (will never change after first step)
+
+            # if one hook type (or just None), then don't bother caching weights for hooks
             orig_hook_mode = self.model_patcher.hook_mode
             if get_total_hook_groups_in_conds(self.conds) <= 1:
                 self.model_patcher.hook_mode = comfy.hooks.EnumHookMode.MinVram
+
             comfy.sampler_helpers.prepare_model_patcher(self.model_patcher, self.conds, self.model_options)
             filter_registered_hooks_on_conds(self.conds, self.model_options)
+
             executor = comfy.patcher_extension.WrapperExecutor.new_class_executor(
                 self.outer_sample,
                 self,
-                comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, self.model_options, is_model_options=True)
+                comfy.patcher_extension.get_all_wrappers(
+                    comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
+                    self.model_options,
+                    is_model_options=True,
+                ),
             )
+
             output = executor.execute(
                 noise,
                 latent_image,
@@ -211,33 +313,44 @@ class NAGCFGGuider(CFGGuider):
             self.model_patcher.hook_mode = orig_hook_mode
             self.model_patcher.restore_hook_patches()
 
-        if apply_guidance:
-            switcher.set_origin()
+            if switcher is not None:
+                switcher.set_origin()
 
-        del self.conds
-        del self.nag_negative_cond
+            del self.conds
+            self.nag_negative_cond = None
+
         return output
 
 
 class KSamplerWithNAG(KSampler):
     def sample(
-            self,
-            noise,
-            positive, negative, nag_negative,
-            cfg,
-            nag_scale, nag_tau, nag_alpha, nag_sigma_end,
-            latent_image=None,
-            start_step=None, last_step=None, force_full_denoise=False,
-            denoise_mask=None,
-            sigmas=None, callback=None, disable_pbar=False, seed=None,
-            latent_shapes=None,
-            **kwargs,
+        self,
+        noise,
+        positive,
+        negative,
+        nag_negative,
+        cfg,
+        nag_scale,
+        nag_tau,
+        nag_alpha,
+        nag_sigma_end,
+        latent_image=None,
+        start_step=None,
+        last_step=None,
+        force_full_denoise=False,
+        denoise_mask=None,
+        sigmas=None,
+        callback=None,
+        disable_pbar=False,
+        seed=None,
+        latent_shapes=None,
+        **kwargs,
     ):
         if sigmas is None:
             sigmas = self.sigmas
 
         if last_step is not None and last_step < (len(sigmas) - 1):
-            sigmas = sigmas[:last_step + 1]
+            sigmas = sigmas[: last_step + 1]
             if force_full_denoise:
                 sigmas[-1] = 0
 
@@ -247,17 +360,21 @@ class KSamplerWithNAG(KSampler):
             else:
                 if latent_image is not None:
                     return latent_image
-                else:
-                    return torch.zeros_like(noise)
+                return torch.zeros_like(noise)
 
         sampler = sampler_object(self.sampler)
 
         return sample_with_nag(
             self.model,
             noise,
-            positive, negative, nag_negative,
+            positive,
+            negative,
+            nag_negative,
             cfg,
-            nag_scale, nag_tau, nag_alpha, nag_sigma_end,
+            nag_scale,
+            nag_tau,
+            nag_alpha,
+            nag_sigma_end,
             self.device,
             sampler,
             sigmas,
@@ -270,4 +387,3 @@ class KSamplerWithNAG(KSampler):
             latent_shapes=latent_shapes,
             **kwargs,
         )
-
